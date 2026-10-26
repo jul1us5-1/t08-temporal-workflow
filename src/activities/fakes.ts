@@ -7,11 +7,11 @@
  */
 import { DomainError } from '../shared/errors';
 import {
+  ERROR_CODES,
   Money,
   PaymentRequest,
   PolicyDecision,
   RailSubmission,
-  ReconciliationResult,
   Reservation,
   SettlementStatus,
 } from '../shared/types';
@@ -19,7 +19,7 @@ import { LedgerEvent, Ports } from './ports';
 
 export interface FakeBehaviour {
   policy: PolicyDecision['outcome'];
-  /** Si true, reserve responde InsufficientAuthority. */
+  /** Si true, reserve responde AGP-ORC-2001 (insufficient_authority). */
   insufficientAuthority: boolean;
   /** Nº de veces que execute falla con error transitorio antes de funcionar. */
   railTransientFailures: number;
@@ -30,7 +30,6 @@ export interface FakeBehaviour {
   /** Qué devuelve getStatus mientras está PENDING; null = nunca cambia. */
   settlesAfterPolls: number | null;
   settlementFails: boolean;
-  reconciliation: ReconciliationResult['status'];
 }
 
 export const DEFAULT_BEHAVIOUR: FakeBehaviour = {
@@ -41,7 +40,6 @@ export const DEFAULT_BEHAVIOUR: FakeBehaviour = {
   railSubmission: 'SETTLED',
   settlesAfterPolls: 0,
   settlementFails: false,
-  reconciliation: 'MATCHED',
 };
 
 export interface FakeState {
@@ -76,7 +74,7 @@ export function createFakePorts(overrides: Partial<FakeBehaviour> = {}): { ports
     session: {
       async reserve(sessionId: string, amount: Money, k: string): Promise<Reservation> {
         state.calls.push('session.reserve');
-        if (behaviour.insufficientAuthority) throw new DomainError('InsufficientAuthority', 'saldo de sesión insuficiente');
+        if (behaviour.insufficientAuthority) throw new DomainError(ERROR_CODES.INSUFFICIENT_AUTHORITY, 'saldo de sesión insuficiente');
         return once(k, () => {
           const reservationId = `res_${state.reservations.size + 1}`;
           state.reservations.set(reservationId, { sessionId, amount, status: 'RESERVED' });
@@ -99,7 +97,7 @@ export function createFakePorts(overrides: Partial<FakeBehaviour> = {}): { ports
     rail: {
       async execute(req: PaymentRequest, _reservationId: string, k: string): Promise<RailSubmission> {
         state.calls.push('rail.execute');
-        if (behaviour.railRejects) throw new DomainError('RailRejected', 'el rail rechazó el pago');
+        if (behaviour.railRejects) throw new DomainError(ERROR_CODES.RAIL_REJECTED, 'el rail rechazó el pago');
         if (railFailuresLeft > 0) {
           railFailuresLeft--;
           throw new Error('rail no disponible (transitorio)');
@@ -123,13 +121,6 @@ export function createFakePorts(overrides: Partial<FakeBehaviour> = {}): { ports
         await once(k, () => {
           state.ledger.push({ paymentId, event, data });
         });
-      },
-    },
-    reconciliation: {
-      async reconcile(): Promise<ReconciliationResult> {
-        state.calls.push('reconciliation.reconcile');
-        const s = behaviour.reconciliation;
-        return s === 'MISMATCH' ? { status: 'MISMATCH', reason: 'amount_differs' } : { status: s };
       },
     },
   };

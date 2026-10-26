@@ -23,7 +23,7 @@ reserve → execute → wait → retry → compensate → reconcile
 | Ejecutar en el protocolo y rail elegidos | Protocol Selector / Adapter / Rail Adapter | T-09 … T-13 · IMP-08 |
 | Confirmar la liquidación on-chain | Chain Indexer (por señal) | T-16 · IMP-11 |
 | Registrar cada hecho financiero | Ledger | T-14 · IMP-09 |
-| Conciliar ledger ↔ rail/cadena | Reconciliation Engine | T-15 · IMP-10 |
+| Conciliar ledger ↔ rail/cadena (T-15 emite intenciones que T-08 aplica) | Reconciliation Engine | T-15 · IMP-10 |
 
 ## Flujo
 
@@ -46,15 +46,21 @@ stateDiagram-v2
     COMPENSATING --> FAILED: reverse + release (orden inverso)
     COMPENSATING --> CANCELLED
     SETTLED --> RECONCILING: consume reserva + ledger
-    RECONCILING --> COMPLETED: MATCHED o NEEDS_REVIEW
+    RECONCILING --> RECONCILING: intención RETRY de T-15
+    RECONCILING --> REOPENED: REOPEN_COMPENSATE (reorg)
+    REOPENED --> RECONCILING: vuelve a liquidar
+    REOPENED --> COMPLETED: no vuelve a liquidar → NEEDS_REVIEW (AGP-ORC-4003)
+    RECONCILING --> COMPLETED: RECONCILED → MATCHED · REQUIRES_REVIEW o timeout → NEEDS_REVIEW
 ```
 
 ### Garantías
 
 - **Idempotencia de extremo a extremo.** `workflowId = paymentId`, así que el mismo pago no puede iniciarse dos veces. Cada llamada a otro servicio lleva una `idempotency-key` determinista (`<paymentId>:<paso>`), así que un reintento de Temporal nunca repite un efecto.
-- **Reintentos con criterio.** Los errores de red o 5xx se reintentan con backoff exponencial. Los errores de negocio (`PolicyDenied`, `InsufficientAuthority`, `SessionExpired`, `SessionRevoked`, `RailRejected`, `ValidationError`) no se reintentan nunca.
+- **Reintentos con criterio.** Los errores de red o 5xx se reintentan con backoff exponencial. Los errores de negocio (`AGP-ORC-1001` policy, `2001`–`2003` sesión, `3001` rail, `9003` request inválido) no se reintentan nunca.
+- **Taxonomía AGP-ORC.** Los códigos siguen el formato del club (`AGP-ORC-NNNN` + nombre, como AGP-REC de T-15) y los errores se serializan como RFC 9457. Ver [`docs/error-taxonomy.md`](docs/error-taxonomy.md) y `src/errors/taxonomy.ts`.
 - **Saga / compensación.** Cada efecto reversible registra su compensación *antes* de seguir. Ante un fallo o una cancelación se ejecutan en orden inverso (`reverse_payment` y luego `release_reservation`) dentro de un scope no cancelable y con reintentos ilimitados.
-- **Sin reversos automáticos tras liquidar.** Si el dinero ya se movió, una discrepancia no se "arregla" sola: queda como `RECONCILIATION_EXCEPTION` / `NEEDS_REVIEW` para que la vea un humano (T-15).
+- **Sin reversos automáticos tras liquidar.** Si el dinero ya se movió, una discrepancia no se "arregla" sola: queda como `RECONCILIATION_EXCEPTION` / `NEEDS_REVIEW` para que la vea un humano.
+- **Conciliación por intenciones.** T-15 decide si el pago cuadra; T-08 solo aplica sus intenciones (`RECONCILED`, `RETRY`, `REQUIRES_REVIEW`, `REOPEN_COMPENSATE`), sin duplicados. Ver [`docs/contrato-t15-intenciones.md`](docs/contrato-t15-intenciones.md).
 - **Observabilidad.** La query `status` devuelve la etapa actual, las referencias externas, las compensaciones ejecutadas y el historial de etapas.
 
 ### API del workflow
@@ -64,6 +70,7 @@ stateDiagram-v2
 | Workflow | `paymentOrchestrationWorkflow(req, opts?)` | Inicia un pago. `opts` ajusta timeouts (`approvalTimeout`, `settlementTimeout`, `settlementPollInterval`, `reconciliationTimeout`). |
 | Signal | `approval` `{ approved, approverId, comment? }` | Respuesta humana cuando Policy devuelve `REVIEW`. |
 | Signal | `settlement` `{ externalRef, status, txHash?, reason? }` | El Chain Indexer (T-16) o un webhook del rail avisa la liquidación. |
+| Signal | `reconciliationIntent` `ReconciliationIntent` | Intención de T-15. Usar `deliverReconciliationIntent()` (`src/client/`). |
 | Query | `status` | Estado actual (`PaymentStatus`). |
 | Cancel | `handle.cancel()` | Cancela y compensa lo que haga falta. |
 
@@ -75,20 +82,27 @@ Task queue por defecto: `payments-orchestration`.
 src/
   shared/types.ts            Tipos de dominio, señales, opciones, errores no reintentables
   shared/errors.ts           DomainError (error de negocio → no reintentable)
-  activities/ports.ts        Interfaces hacia T-06, T-07, T-09..T-13, T-14, T-15
+  errors/taxonomy.ts         Taxonomía AGP-ORC + toProblemDetails (RFC 9457)
+  activities/ports.ts        Interfaces hacia T-06, T-07, T-09..T-13, T-14
   activities/index.ts        Activities: adaptadores finos sobre los puertos
   activities/http-clients.ts Implementación HTTP (contrato propuesto, ver docs/contratos.md)
   activities/fakes.ts        Implementación en memoria (tests y demo)
   workflows/payment-orchestration.workflow.ts   El workflow
   worker.ts                  Proceso worker
   client/start-payment.ts    Cliente de ejemplo
-test/payment-orchestration.test.ts   16 escenarios contra un Temporal real
+  client/deliver-reconciliation-intent.ts  Adapter T-15 → T-08
+test/payment-orchestration.test.ts   21 escenarios contra un Temporal real
+test/taxonomy.test.ts                Taxonomía AGP-ORC y lectura de errores RFC 9457
 docs/contratos.md            Contratos HTTP propuestos para los otros módulos
+docs/contrato-t15-intenciones.md  Contrato con T-15 (respuesta a P-S5-6)
+docs/error-taxonomy.md       Taxonomía AGP-ORC
 ```
 
 ## Cómo correrlo
 
 Requisitos: Node 18+ y el [Temporal CLI](https://docs.temporal.io/cli).
+
+> El stack del club es Bun, pero el worker de Temporal para TypeScript usa un módulo nativo que solo soporta Node.js. Por eso este servicio corre con Node; los demás módulos lo integran por Temporal (señales) y HTTP, sin importar en qué runtime corren.
 
 ```bash
 npm install
@@ -99,7 +113,7 @@ temporal server start-dev
 # 2) Worker con servicios simulados en memoria
 PORTS=fake npm run worker
 #    …o contra los servicios reales:
-#    POLICY_URL=… PAYMENT_SESSION_URL=… RAIL_URL=… LEDGER_URL=… RECONCILIATION_URL=… npm run worker
+#    POLICY_URL=… PAYMENT_SESSION_URL=… RAIL_URL=… LEDGER_URL=… npm run worker
 
 # 3) Lanzar un pago de ejemplo
 npm run start:payment -- pay_001
@@ -114,11 +128,12 @@ npm test                                   # usa el servidor de test de Temporal
 TEMPORAL_CLI_PATH=$(which temporal) npm test   # o tu Temporal CLI local, sin descargas
 ```
 
-Escenarios cubiertos: camino feliz; Policy DENY; REVIEW aprobado por señal; cancelación esperando aprobación; REVIEW sin respuesta (timeout); sin autoridad de gasto (no reintenta); fallos transitorios del rail (reintenta); rail rechaza (compensa); liquidación por señal del Chain Indexer; liquidación por sondeo; timeout de liquidación (compensa); fallo on-chain (compensa); cancelación durante la espera (compensa); conciliación con discrepancia (NEEDS_REVIEW sin revertir); conciliación que no llega (NEEDS_REVIEW); idempotencia por `paymentId`.
+Escenarios cubiertos: camino feliz; Policy DENY; REVIEW aprobado por señal; cancelación esperando aprobación; REVIEW sin respuesta (timeout); sin autoridad de gasto (no reintenta); fallos transitorios del rail (reintenta); rail rechaza (compensa); liquidación por señal del Chain Indexer; liquidación por sondeo; timeout de liquidación (compensa); fallo on-chain (compensa); cancelación durante la espera (compensa); T-15 `REQUIRES_REVIEW` (NEEDS_REVIEW sin revertir); T-15 sin respuesta (timeout); `RETRY` + duplicados + intenciones de otro pago; intención antes de `RECONCILING`; reorg que vuelve a liquidar; reorg sin liquidación (`AGP-ORC-4003`); adapter `deliverReconciliationIntent`; idempotencia por `paymentId`.
 
 ## Pendientes / a coordinar
 
-- Acordar con T-06, T-07, T-13, T-14 y T-15 las rutas y cuerpos de `docs/contratos.md` (son una propuesta).
+- Acordar con T-06, T-07, T-13 y T-14 las rutas y cuerpos de `docs/contratos.md` (son una propuesta).
+- Congelar con T-15 el contrato de intenciones (`docs/contrato-t15-intenciones.md`, preguntas abiertas al final).
 - Que T-16 (Chain Indexer) envíe la señal `settlement` al workflow `paymentId` cuando vea la transacción.
 - Instrumentación OpenTelemetry (T-19) con `@temporalio/interceptors-opentelemetry`.
 - TLS / mTLS y credenciales vía KMS (T-20) para la conexión a Temporal en entornos no locales.
