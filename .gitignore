@@ -1,0 +1,4 @@
+node_modules/
+dist/
+workflow-bundle-*.js
+*.log

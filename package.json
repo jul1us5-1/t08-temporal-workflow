@@ -1,0 +1,31 @@
+{
+  "name": "t08-temporal-workflow",
+  "version": "0.1.0",
+  "description": "T-08 Temporal Workflow (IMP-07): orquestación durable reserve → execute → wait → retry → compensate → reconcile",
+  "main": "dist/src/worker.js",
+  "scripts": {
+    "build": "tsc",
+    "worker": "ts-node src/worker.ts",
+    "start:payment": "ts-node src/client/start-payment.ts",
+    "test": "jest --runInBand",
+    "lint": "tsc --noEmit"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@temporalio/activity": "^1.24.0",
+    "@temporalio/client": "^1.24.0",
+    "@temporalio/worker": "^1.24.0",
+    "@temporalio/workflow": "^1.24.0"
+  },
+  "devDependencies": {
+    "@temporalio/testing": "^1.24.0",
+    "@types/jest": "^30.0.0",
+    "@types/node": "^26.6.5",
+    "jest": "^30.5.2",
+    "ts-jest": "^29.4.15",
+    "ts-node": "^10.9.2",
+    "typescript": "5.9"
+  }
+}
