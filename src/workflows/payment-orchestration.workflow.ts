@@ -34,6 +34,7 @@ import type { Activities } from '../activities';
 import {
   ApprovalSignal,
   DEFAULT_OPTIONS,
+  ERROR_CODES,
   NON_RETRYABLE_ERRORS,
   OrchestrationOptions,
   PaymentRequest,
@@ -259,7 +260,7 @@ export async function paymentOrchestrationWorkflow(
     for (;;) {
       const remaining = deadline - Date.now();
       if (remaining <= 0) {
-        throw ApplicationFailure.create({ type: 'SettlementTimeout', message: `sin liquidación tras ${options.settlementTimeout}` });
+        throw ApplicationFailure.create({ type: ERROR_CODES.SETTLEMENT_TIMEOUT, message: `sin liquidación tras ${options.settlementTimeout}` });
       }
       // Espera la señal o el próximo sondeo, lo que ocurra primero.
       await condition(() => settlements.has(externalRef), Math.min(remaining, ms(options.settlementPollInterval)));
@@ -276,7 +277,7 @@ export async function paymentOrchestrationWorkflow(
         return;
       }
       if (observed.status === 'FAILED') {
-        throw ApplicationFailure.create({ type: 'SettlementFailed', message: observed.reason, nonRetryable: true });
+        throw ApplicationFailure.create({ type: ERROR_CODES.SETTLEMENT_FAILED, message: observed.reason, nonRetryable: true });
       }
     }
   }
@@ -325,7 +326,7 @@ function describe(err: unknown): string {
 export function ms(d: string | number): number {
   if (typeof d === 'number') return d;
   const m = /^(\d+(?:\.\d+)?)\s*(ms|s|m|h|d)$/.exec(d.trim());
-  if (!m) throw ApplicationFailure.create({ type: 'ValidationError', message: `duración inválida: ${d}`, nonRetryable: true });
+  if (!m) throw ApplicationFailure.create({ type: ERROR_CODES.VALIDATION_ERROR, message: `duración inválida: ${d}`, nonRetryable: true });
   const n = Number(m[1]);
   const unit = { ms: 1, s: 1_000, m: 60_000, h: 3_600_000, d: 86_400_000 }[m[2] as 'ms' | 's' | 'm' | 'h' | 'd'];
   return n * unit;

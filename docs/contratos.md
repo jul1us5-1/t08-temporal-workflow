@@ -5,7 +5,7 @@ Esto es una **propuesta** para acordar con cada equipo. El código que la implem
 ## Convenciones comunes
 
 - Todas las operaciones que cambian estado reciben la cabecera `idempotency-key`. Repetir una llamada con la misma clave **debe** devolver el mismo resultado sin repetir el efecto, porque Temporal ejecuta las activities *al menos una vez*.
-- Errores de negocio: HTTP 4xx con cuerpo `{ "error": "<Tipo>", "message": "..." }`, donde `<Tipo>` es uno de `PolicyDenied`, `InsufficientAuthority`, `SessionExpired`, `SessionRevoked`, `RailRejected`, `ValidationError`. El workflow **no** los reintenta.
+- Errores de negocio: HTTP 4xx con cuerpo `{ "error": "<Tipo>", "message": "..." }`, donde `<Tipo>` es uno de `AGP-ORC-POLICY_DENIED`, `AGP-ORC-INSUFFICIENT_AUTHORITY`, `AGP-ORC-SESSION_EXPIRED`, `AGP-ORC-SESSION_REVOKED`, `AGP-ORC-RAIL_REJECTED`, `AGP-ORC-VALIDATION_ERROR`. El workflow **no** los reintenta.
 - Cualquier otro error (5xx, timeout, red) se reintenta con backoff exponencial.
 - Montos como string en unidades mínimas: `{ "amount": "1500000", "currency": "USDC" }`.
 
@@ -25,7 +25,7 @@ Con `REVIEW`, el workflow espera la señal `approval` (por defecto hasta 24 h).
 
 | Método y ruta | Cuerpo | Respuesta |
 |---|---|---|
-| `POST /v1/sessions/{sessionId}/reservations` | `{ amount }` | `{ reservationId, expiresAt? }` o 4xx `InsufficientAuthority` / `SessionExpired` / `SessionRevoked` |
+| `POST /v1/sessions/{sessionId}/reservations` | `{ amount }` | `{ reservationId, expiresAt? }` o 4xx `AGP-ORC-INSUFFICIENT_AUTHORITY` / `AGP-ORC-SESSION_EXPIRED` / `AGP-ORC-SESSION_REVOKED` |
 | `POST /v1/reservations/{reservationId}/consume` | `{}` | 2xx |
 | `POST /v1/reservations/{reservationId}/release` | `{ reason }` | 2xx (también si ya estaba liberada) |
 
@@ -33,7 +33,7 @@ Con `REVIEW`, el workflow espera la señal `approval` (por defecto hasta 24 h).
 
 | Método y ruta | Cuerpo | Respuesta |
 |---|---|---|
-| `POST /v1/payments` | `PaymentRequest` + `reservationId` | `{ status: "SETTLED" \| "PENDING", externalRef, txHash? }` o 4xx `RailRejected` |
+| `POST /v1/payments` | `PaymentRequest` + `reservationId` | `{ status: "SETTLED" \| "PENDING", externalRef, txHash? }` o 4xx `AGP-ORC-RAIL_REJECTED` |
 | `GET /v1/payments/{externalRef}` | | `{ status: "PENDING" }`, `{ status: "SETTLED", txHash? }` o `{ status: "FAILED", reason }` |
 | `POST /v1/payments/reverse` | `{ executionKey, externalRef?, reason }` | 2xx (idempotente, también si no había nada que anular) |
 

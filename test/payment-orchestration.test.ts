@@ -11,7 +11,7 @@ import { TestWorkflowEnvironment } from '@temporalio/testing';
 import { Runtime, DefaultLogger, Worker } from '@temporalio/worker';
 import { createActivities } from '../src/activities';
 import { createFakePorts, FakeBehaviour, FakeState } from '../src/activities/fakes';
-import { OrchestrationOptions, PaymentRequest, PaymentResult } from '../src/shared/types';
+import { ERROR_CODES, OrchestrationOptions, PaymentRequest, PaymentResult } from '../src/shared/types';
 import {
   approvalSignal,
   paymentOrchestrationWorkflow,
@@ -163,7 +163,7 @@ describe('T-08 paymentOrchestrationWorkflow', () => {
   test('sin autoridad de gasto (T-07): falla sin reintentar y sin ejecutar', async () => {
     const { result, state } = await run({ insufficientAuthority: true });
     expect(result.outcome).toBe('FAILED');
-    expect(result.status.failureReason).toContain('InsufficientAuthority');
+    expect(result.status.failureReason).toContain(ERROR_CODES.INSUFFICIENT_AUTHORITY);
     expect(state.calls.filter((c) => c === 'session.reserve')).toHaveLength(1);
     expect(state.calls).not.toContain('rail.execute');
     expect(result.status.compensations).toEqual([]);
@@ -210,7 +210,7 @@ describe('T-08 paymentOrchestrationWorkflow', () => {
   test('sin liquidación antes del timeout: compensa', async () => {
     const { result, state } = await run({ railSubmission: 'PENDING', settlesAfterPolls: null });
     expect(result.outcome).toBe('FAILED');
-    expect(result.status.failureReason).toContain('SettlementTimeout');
+    expect(result.status.failureReason).toContain(ERROR_CODES.SETTLEMENT_TIMEOUT);
     expect(result.status.compensations).toEqual(['reverse_payment', 'release_reservation']);
     expect(reservationStatus(state)).toEqual(['RELEASED']);
   });
@@ -218,7 +218,7 @@ describe('T-08 paymentOrchestrationWorkflow', () => {
   test('liquidación fallida on-chain: compensa', async () => {
     const { result } = await run({ railSubmission: 'PENDING', settlementFails: true });
     expect(result.outcome).toBe('FAILED');
-    expect(result.status.failureReason).toContain('SettlementFailed');
+    expect(result.status.failureReason).toContain(ERROR_CODES.SETTLEMENT_FAILED);
     expect(result.status.compensations).toEqual(['reverse_payment', 'release_reservation']);
   });
 

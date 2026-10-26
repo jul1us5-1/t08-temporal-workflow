@@ -52,7 +52,7 @@ stateDiagram-v2
 ### Garantías
 
 - **Idempotencia de extremo a extremo.** `workflowId = paymentId`, así que el mismo pago no puede iniciarse dos veces. Cada llamada a otro servicio lleva una `idempotency-key` determinista (`<paymentId>:<paso>`), así que un reintento de Temporal nunca repite un efecto.
-- **Reintentos con criterio.** Los errores de red o 5xx se reintentan con backoff exponencial. Los errores de negocio (`PolicyDenied`, `InsufficientAuthority`, `SessionExpired`, `SessionRevoked`, `RailRejected`, `ValidationError`) no se reintentan nunca.
+- **Reintentos con criterio.** Los errores de red o 5xx se reintentan con backoff exponencial. Los errores de negocio (`AGP-ORC-POLICY_DENIED`, `AGP-ORC-INSUFFICIENT_AUTHORITY`, `AGP-ORC-SESSION_EXPIRED`, `AGP-ORC-SESSION_REVOKED`, `AGP-ORC-RAIL_REJECTED`, `AGP-ORC-VALIDATION_ERROR`) no se reintentan nunca. Todos los códigos siguen el estándar `AGP-ORC-(Nombre)` y están en `ERROR_CODES` (`src/shared/types.ts`); el workflow además usa `AGP-ORC-SETTLEMENT_TIMEOUT` y `AGP-ORC-SETTLEMENT_FAILED`.
 - **Saga / compensación.** Cada efecto reversible registra su compensación *antes* de seguir. Ante un fallo o una cancelación se ejecutan en orden inverso (`reverse_payment` y luego `release_reservation`) dentro de un scope no cancelable y con reintentos ilimitados.
 - **Sin reversos automáticos tras liquidar.** Si el dinero ya se movió, una discrepancia no se "arregla" sola: queda como `RECONCILIATION_EXCEPTION` / `NEEDS_REVIEW` para que la vea un humano (T-15).
 - **Observabilidad.** La query `status` devuelve la etapa actual, las referencias externas, las compensaciones ejecutadas y el historial de etapas.

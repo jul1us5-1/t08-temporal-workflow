@@ -127,14 +127,30 @@ export interface PaymentResult {
   status: PaymentStatus;
 }
 
-/** Tipos de error de aplicación que NO deben reintentarse. */
+/**
+ * Códigos de error del orquestador, con el estándar del proyecto:
+ * `AGP-ORC-(Nombre)`, en MAYÚSCULAS y con guion bajo entre palabras.
+ */
+export const ERROR_CODES = {
+  POLICY_DENIED: 'AGP-ORC-POLICY_DENIED',
+  INSUFFICIENT_AUTHORITY: 'AGP-ORC-INSUFFICIENT_AUTHORITY',
+  SESSION_EXPIRED: 'AGP-ORC-SESSION_EXPIRED',
+  SESSION_REVOKED: 'AGP-ORC-SESSION_REVOKED',
+  RAIL_REJECTED: 'AGP-ORC-RAIL_REJECTED',
+  VALIDATION_ERROR: 'AGP-ORC-VALIDATION_ERROR',
+  SETTLEMENT_TIMEOUT: 'AGP-ORC-SETTLEMENT_TIMEOUT',
+  SETTLEMENT_FAILED: 'AGP-ORC-SETTLEMENT_FAILED',
+} as const;
+export type ErrorCode = (typeof ERROR_CODES)[keyof typeof ERROR_CODES];
+
+/** Códigos de error de negocio que NO deben reintentarse. */
 export const NON_RETRYABLE_ERRORS = [
-  'PolicyDenied',
-  'InsufficientAuthority',
-  'SessionExpired',
-  'SessionRevoked',
-  'RailRejected',
-  'ValidationError',
+  ERROR_CODES.POLICY_DENIED,
+  ERROR_CODES.INSUFFICIENT_AUTHORITY,
+  ERROR_CODES.SESSION_EXPIRED,
+  ERROR_CODES.SESSION_REVOKED,
+  ERROR_CODES.RAIL_REJECTED,
+  ERROR_CODES.VALIDATION_ERROR,
 ] as const;
 export type NonRetryableErrorType = (typeof NON_RETRYABLE_ERRORS)[number];
 
