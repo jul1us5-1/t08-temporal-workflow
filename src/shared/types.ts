@@ -36,7 +36,7 @@ export interface OrchestrationOptions {
   settlementTimeout: string;
   /** Intervalo de sondeo al rail mientras no llega la señal de liquidación. */
   settlementPollInterval: string;
-  /** Cuánto esperar a que Reconciliation confirme el match antes de marcar revisión. */
+  /** Cuánto esperar una intención final de T-15 (RECONCILED / REQUIRES_REVIEW) antes de marcar revisión. */
   reconciliationTimeout: string;
 }
 
@@ -68,10 +68,28 @@ export type SettlementStatus =
   | { status: 'SETTLED'; txHash?: string; settledAt?: string }
   | { status: 'FAILED'; reason: string };
 
-export type ReconciliationResult =
-  | { status: 'MATCHED' }
-  | { status: 'PENDING' }
-  | { status: 'MISMATCH'; reason: string };
+/**
+ * Intención que T-15 (ap-reconciliation-service) emite hacia T-08.
+ * Mismo shape que `WorkflowIntent` de `src/harness/workflow.ts` en la rama
+ * `feat/s5-external-workflow-ports` de T-15 (snake_case), más el `intent_id`
+ * que devuelve su `WorkflowReceipt`, que T-08 usa para descartar duplicados.
+ *
+ *   RECONCILED         match con evidencia externa → el pago se cierra
+ *   RETRY              falta evidencia o dependencia caída → T-15 volverá a intentar
+ *   REQUIRES_REVIEW    diferencia material → revisión humana
+ *   REOPEN_COMPENSATE  reorg / finality → reabrir y volver a esperar liquidación
+ */
+export type ReconciliationIntentKind = 'RECONCILED' | 'RETRY' | 'REQUIRES_REVIEW' | 'REOPEN_COMPENSATE';
+
+export interface ReconciliationIntent {
+  intent_id: string;
+  kind: ReconciliationIntentKind;
+  payment_id: string | null;
+  /** Código AGP-REC que motiva la intención; null cuando es un match. */
+  code: string | null;
+  reason: string;
+  evidence: string;
+}
 
 // ----- Señales que recibe el workflow -----
 
@@ -100,6 +118,7 @@ export type PaymentStage =
   | 'AWAITING_SETTLEMENT'
   | 'SETTLED'
   | 'RECONCILING'
+  | 'REOPENED'
   | 'COMPLETED'
   | 'COMPENSATING'
   | 'FAILED'
@@ -114,6 +133,10 @@ export interface PaymentStatus {
   txHash?: string;
   policyDecisionId?: string;
   reconciliation?: 'MATCHED' | 'NEEDS_REVIEW';
+  /** Código que explica el resultado: AGP-REC de T-15 o AGP-ORC propio. */
+  reconciliationCode?: string;
+  /** Intenciones de T-15 ya aplicadas (por intent_id), para auditoría e idempotencia. */
+  appliedIntents: string[];
   failureReason?: string;
   compensations: string[];
   history: { stage: PaymentStage; at: string }[];
@@ -128,29 +151,36 @@ export interface PaymentResult {
 }
 
 /**
- * Códigos de error del orquestador, con el estándar del proyecto:
- * `AGP-ORC-(Nombre)`, en MAYÚSCULAS y con guion bajo entre palabras.
+ * Códigos de error del orquestador. El detalle de cada uno (nombre, familia,
+ * severidad, resolución) está en `src/errors/taxonomy.ts` (AGP-ORC v1.0.0).
  */
 export const ERROR_CODES = {
-  POLICY_DENIED: 'AGP-ORC-POLICY_DENIED',
-  INSUFFICIENT_AUTHORITY: 'AGP-ORC-INSUFFICIENT_AUTHORITY',
-  SESSION_EXPIRED: 'AGP-ORC-SESSION_EXPIRED',
-  SESSION_REVOKED: 'AGP-ORC-SESSION_REVOKED',
-  RAIL_REJECTED: 'AGP-ORC-RAIL_REJECTED',
-  VALIDATION_ERROR: 'AGP-ORC-VALIDATION_ERROR',
-  SETTLEMENT_TIMEOUT: 'AGP-ORC-SETTLEMENT_TIMEOUT',
-  SETTLEMENT_FAILED: 'AGP-ORC-SETTLEMENT_FAILED',
+  POLICY_DENIED: 'AGP-ORC-1001',
+  APPROVAL_REJECTED: 'AGP-ORC-1002',
+  APPROVAL_TIMEOUT: 'AGP-ORC-1003',
+  INSUFFICIENT_AUTHORITY: 'AGP-ORC-2001',
+  SESSION_EXPIRED: 'AGP-ORC-2002',
+  SESSION_REVOKED: 'AGP-ORC-2003',
+  RAIL_REJECTED: 'AGP-ORC-3001',
+  SETTLEMENT_FAILED: 'AGP-ORC-3002',
+  SETTLEMENT_TIMEOUT: 'AGP-ORC-3003',
+  RECONCILIATION_REVIEW_REQUIRED: 'AGP-ORC-4001',
+  RECONCILIATION_TIMEOUT: 'AGP-ORC-4002',
+  REORG_UNRESOLVED: 'AGP-ORC-4003',
+  DEPENDENCY_UNAVAILABLE: 'AGP-ORC-9001',
+  INTERNAL_ERROR: 'AGP-ORC-9002',
+  INVALID_REQUEST: 'AGP-ORC-9003',
 } as const;
 export type ErrorCode = (typeof ERROR_CODES)[keyof typeof ERROR_CODES];
 
-/** Códigos de error de negocio que NO deben reintentarse. */
+/** Códigos de error de negocio que devuelven otros módulos y que NO deben reintentarse. */
 export const NON_RETRYABLE_ERRORS = [
   ERROR_CODES.POLICY_DENIED,
   ERROR_CODES.INSUFFICIENT_AUTHORITY,
   ERROR_CODES.SESSION_EXPIRED,
   ERROR_CODES.SESSION_REVOKED,
   ERROR_CODES.RAIL_REJECTED,
-  ERROR_CODES.VALIDATION_ERROR,
+  ERROR_CODES.INVALID_REQUEST,
 ] as const;
 export type NonRetryableErrorType = (typeof NON_RETRYABLE_ERRORS)[number];
 

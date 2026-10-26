@@ -13,7 +13,6 @@ import {
   PaymentRequest,
   PolicyDecision,
   RailSubmission,
-  ReconciliationResult,
   Reservation,
   SettlementStatus,
 } from '../shared/types';
@@ -53,6 +52,7 @@ export type LedgerEvent =
   | 'PAYMENT_FAILED'
   | 'PAYMENT_REVERSED'
   | 'RESERVATION_RELEASED'
+  | 'PAYMENT_REOPENED'
   | 'PAYMENT_RECONCILED'
   | 'RECONCILIATION_EXCEPTION';
 
@@ -66,16 +66,15 @@ export interface LedgerPort {
   ): Promise<void>;
 }
 
-/** T-15 Reconciliation Engine (IMP-10). */
-export interface ReconciliationPort {
-  /** Pide el match ledger ↔ rail/cadena. Puede responder PENDING si aún no hay datos. */
-  reconcile(paymentId: string, externalRef: string, idempotencyKey: string): Promise<ReconciliationResult>;
-}
+/*
+ * T-15 Reconciliation (IMP-10) no es un puerto de salida: T-15 se activa con el
+ * outbox del Ledger y EMITE intenciones hacia T-08, que llegan al workflow como
+ * la señal `reconciliationIntent` (ver src/client/deliver-reconciliation-intent.ts).
+ */
 
 export interface Ports {
   policy: PolicyPort;
   session: PaymentSessionPort;
   rail: RailPort;
   ledger: LedgerPort;
-  reconciliation: ReconciliationPort;
 }

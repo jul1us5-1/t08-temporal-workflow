@@ -11,10 +11,19 @@ import { TestWorkflowEnvironment } from '@temporalio/testing';
 import { Runtime, DefaultLogger, Worker } from '@temporalio/worker';
 import { createActivities } from '../src/activities';
 import { createFakePorts, FakeBehaviour, FakeState } from '../src/activities/fakes';
-import { ERROR_CODES, OrchestrationOptions, PaymentRequest, PaymentResult } from '../src/shared/types';
+import { WorkflowHandle } from '@temporalio/client';
+import { deliverReconciliationIntent } from '../src/client/deliver-reconciliation-intent';
+import {
+  ERROR_CODES,
+  OrchestrationOptions,
+  PaymentRequest,
+  PaymentResult,
+  ReconciliationIntent,
+} from '../src/shared/types';
 import {
   approvalSignal,
   paymentOrchestrationWorkflow,
+  reconciliationIntentSignal,
   settlementSignal,
   statusQuery,
 } from '../src/workflows';
@@ -71,18 +80,58 @@ async function withWorker<T>(
   return worker.runUntil(fn({ taskQueue, state }));
 }
 
+type PaymentHandle = WorkflowHandle<typeof paymentOrchestrationWorkflow>;
+
+function intent(paymentId: string, overrides: Partial<ReconciliationIntent> = {}): ReconciliationIntent {
+  return {
+    intent_id: `wf-${randomUUID()}`,
+    kind: 'RECONCILED',
+    payment_id: paymentId,
+    code: null,
+    reason: 'match',
+    evidence: 'ledger y fuente externa coinciden',
+    ...overrides,
+  };
+}
+
+/**
+ * Simula a T-15: cuando el pago llega a RECONCILING emite la intención dada
+ * (por defecto RECONCILED). Con `null` no emite nada.
+ */
+async function fakeT15(handle: PaymentHandle, overrides: Partial<ReconciliationIntent> | null = {}) {
+  if (overrides === null) return;
+  let finished = false;
+  handle.result().then(
+    () => (finished = true),
+    () => (finished = true),
+  );
+  while (!finished) {
+    try {
+      if ((await handle.query(statusQuery)).stage === 'RECONCILING') {
+        await handle.signal(reconciliationIntentSignal, intent(handle.workflowId, overrides));
+        return;
+      }
+    } catch {
+      // el workflow aún no procesó su primera tarea
+    }
+    await new Promise((r) => setTimeout(r, 100));
+  }
+}
+
 async function run(
   behaviour: Partial<FakeBehaviour>,
   opts: Partial<OrchestrationOptions> = FAST,
+  t15: Partial<ReconciliationIntent> | null = {},
 ): Promise<{ result: PaymentResult; state: FakeState }> {
   return withWorker(behaviour, async ({ taskQueue, state }) => {
     const req = request();
-    const result = await env.client.workflow.execute(paymentOrchestrationWorkflow, {
+    const handle = await env.client.workflow.start(paymentOrchestrationWorkflow, {
       taskQueue,
       workflowId: req.paymentId,
       args: [req, opts],
     });
-    return { result, state };
+    void fakeT15(handle, t15);
+    return { result: await handle.result(), state };
   });
 }
 
@@ -128,6 +177,7 @@ describe('T-08 paymentOrchestrationWorkflow', () => {
         workflowId: req.paymentId,
         args: [req, { ...FAST, approvalTimeout: '1m' }],
       });
+      void fakeT15(handle);
       await waitForStage(handle, 'AWAITING_APPROVAL');
       await handle.signal(approvalSignal, { approved: true, approverId: 'ops_1' });
       const result = await handle.result();
@@ -156,7 +206,7 @@ describe('T-08 paymentOrchestrationWorkflow', () => {
   test('Policy REVIEW sin respuesta: rechaza por timeout', async () => {
     const { result, state } = await run({ policy: 'REVIEW' });
     expect(result.outcome).toBe('REJECTED');
-    expect(result.status.failureReason).toBe('approval_timeout');
+    expect(result.status.failureReason).toContain(ERROR_CODES.APPROVAL_TIMEOUT);
     expect(state.calls).not.toContain('session.reserve');
   });
 
@@ -193,6 +243,7 @@ describe('T-08 paymentOrchestrationWorkflow', () => {
         args: [req, { ...FAST, settlementTimeout: '1m' }],
       });
       await waitForStage(handle, 'AWAITING_SETTLEMENT');
+      void fakeT15(handle);
       await handle.signal(settlementSignal, { externalRef: `ext_${req.paymentId}`, status: 'SETTLED', txHash: '0x999' });
       const result = await handle.result();
       expect(result.outcome).toBe('COMPLETED');
@@ -239,18 +290,124 @@ describe('T-08 paymentOrchestrationWorkflow', () => {
     });
   });
 
-  test('conciliación con discrepancia: completa pero marca NEEDS_REVIEW', async () => {
-    const { result, state } = await run({ reconciliation: 'MISMATCH' });
+  test('T-15 REQUIRES_REVIEW: completa pero marca NEEDS_REVIEW con el código AGP-REC', async () => {
+    const { result, state } = await run({}, FAST, {
+      kind: 'REQUIRES_REVIEW',
+      code: 'AGP-REC-1001',
+      reason: 'amount_mismatch',
+    });
     expect(result.outcome).toBe('COMPLETED');
     expect(result.status.reconciliation).toBe('NEEDS_REVIEW');
+    expect(result.status.reconciliationCode).toBe('AGP-REC-1001');
+    expect(result.status.failureReason).toContain(ERROR_CODES.RECONCILIATION_REVIEW_REQUIRED);
     expect(events(state).at(-1)).toBe('RECONCILIATION_EXCEPTION');
     expect(reservationStatus(state)).toEqual(['CONSUMED']); // no se revierte un pago liquidado
   });
 
-  test('conciliación que nunca llega: NEEDS_REVIEW por timeout', async () => {
-    const { result } = await run({ reconciliation: 'PENDING' });
+  test('T-15 no emite nada: NEEDS_REVIEW por timeout (AGP-ORC-4002)', async () => {
+    const { result } = await run({}, FAST, null);
     expect(result.status.reconciliation).toBe('NEEDS_REVIEW');
-    expect(result.status.failureReason).toBe('reconciliation_timeout');
+    expect(result.status.reconciliationCode).toBe(ERROR_CODES.RECONCILIATION_TIMEOUT);
+  });
+
+  test('T-15 RETRY sigue esperando; duplicados y otros pagos se ignoran', async () => {
+    await withWorker({}, async ({ taskQueue }) => {
+      const req = request();
+      const handle = await env.client.workflow.start(paymentOrchestrationWorkflow, {
+        taskQueue,
+        workflowId: req.paymentId,
+        args: [req, { ...FAST, reconciliationTimeout: '1m' }],
+      });
+      await waitForStage(handle, 'RECONCILING');
+      const retry = intent(req.paymentId, { intent_id: 'wf-1', kind: 'RETRY', code: 'AGP-REC-4001', reason: 'in_flight' });
+      await handle.signal(reconciliationIntentSignal, retry);
+      await handle.signal(reconciliationIntentSignal, retry); // redelivery
+      await handle.signal(reconciliationIntentSignal, intent('otro_pago', { intent_id: 'wf-x', kind: 'REQUIRES_REVIEW' }));
+      await handle.signal(reconciliationIntentSignal, intent(req.paymentId, { intent_id: 'wf-2' }));
+      const result = await handle.result();
+      expect(result.status.reconciliation).toBe('MATCHED');
+      expect(result.status.appliedIntents).toEqual(['wf-1', 'wf-2']);
+    });
+  });
+
+  test('una intención que llega antes de RECONCILING se aplica después', async () => {
+    await withWorker({ railSubmission: 'PENDING', settlesAfterPolls: null }, async ({ taskQueue }) => {
+      const req = request();
+      const handle = await env.client.workflow.start(paymentOrchestrationWorkflow, {
+        taskQueue,
+        workflowId: req.paymentId,
+        args: [req, { ...FAST, settlementTimeout: '1m' }],
+      });
+      await waitForStage(handle, 'AWAITING_SETTLEMENT');
+      await handle.signal(reconciliationIntentSignal, intent(req.paymentId));
+      await handle.signal(settlementSignal, { externalRef: `ext_${req.paymentId}`, status: 'SETTLED' });
+      const result = await handle.result();
+      expect(result.outcome).toBe('COMPLETED');
+      expect(result.status.reconciliation).toBe('MATCHED');
+    });
+  });
+
+  test('T-15 REOPEN_COMPENSATE (reorg): reabre, vuelve a liquidar y espera nueva intención', async () => {
+    await withWorker({}, async ({ taskQueue, state }) => {
+      const req = request();
+      const handle = await env.client.workflow.start(paymentOrchestrationWorkflow, {
+        taskQueue,
+        workflowId: req.paymentId,
+        args: [req, { ...FAST, reconciliationTimeout: '1m' }],
+      });
+      await waitForStage(handle, 'RECONCILING');
+      await handle.signal(
+        reconciliationIntentSignal,
+        intent(req.paymentId, { kind: 'REOPEN_COMPENSATE', code: 'AGP-REC-4003', reason: 'reorg_detected' }),
+      );
+      // el fake del rail confirma de nuevo en el primer sondeo; luego T-15 concilia
+      await waitForStage(handle, 'RECONCILING', 15_000, (st) => st.history.some((h) => h.stage === 'REOPENED'));
+      await handle.signal(reconciliationIntentSignal, intent(req.paymentId));
+      const result = await handle.result();
+      expect(result.status.reconciliation).toBe('MATCHED');
+      expect(result.status.history.map((h) => h.stage)).toContain('REOPENED');
+      expect(events(state)).toContain('PAYMENT_REOPENED');
+      expect(events(state).at(-1)).toBe('PAYMENT_RECONCILED');
+    });
+  });
+
+  test('reorg sin nueva liquidación: NEEDS_REVIEW con AGP-ORC-4003', async () => {
+    await withWorker({ settlementFails: true }, async ({ taskQueue }) => {
+      const req = request();
+      const handle = await env.client.workflow.start(paymentOrchestrationWorkflow, {
+        taskQueue,
+        workflowId: req.paymentId,
+        args: [req, { ...FAST, reconciliationTimeout: '1m' }],
+      });
+      await waitForStage(handle, 'RECONCILING');
+      await handle.signal(reconciliationIntentSignal, intent(req.paymentId, { kind: 'REOPEN_COMPENSATE', code: 'AGP-REC-4003' }));
+      const result = await handle.result();
+      expect(result.outcome).toBe('COMPLETED');
+      expect(result.status.reconciliation).toBe('NEEDS_REVIEW');
+      expect(result.status.reconciliationCode).toBe(ERROR_CODES.REORG_UNRESOLVED);
+    });
+  });
+
+  test('adapter deliverReconciliationIntent: entrega, ignora RETRY global y pagos inexistentes', async () => {
+    await withWorker({}, async ({ taskQueue }) => {
+      const req = request();
+      const handle = await env.client.workflow.start(paymentOrchestrationWorkflow, {
+        taskQueue,
+        workflowId: req.paymentId,
+        args: [req, { ...FAST, reconciliationTimeout: '1m' }],
+      });
+      await waitForStage(handle, 'RECONCILING');
+
+      const global = await deliverReconciliationIntent(env.client, intent(req.paymentId, { payment_id: null, kind: 'RETRY' }));
+      expect(global).toMatchObject({ delivered: false, reason: 'run_level_intent' });
+
+      const missing = await deliverReconciliationIntent(env.client, intent(`pay_inexistente_${randomUUID()}`));
+      expect(missing).toMatchObject({ delivered: false, reason: 'payment_not_found' });
+
+      const ok = await deliverReconciliationIntent(env.client, intent(req.paymentId));
+      expect(ok.delivered).toBe(true);
+      expect((await handle.result()).status.reconciliation).toBe('MATCHED');
+    });
   });
 
   test('idempotencia: el mismo paymentId no inicia dos pagos', async () => {
@@ -269,14 +426,16 @@ describe('T-08 paymentOrchestrationWorkflow', () => {
 });
 
 async function waitForStage(
-  handle: { query: (q: typeof statusQuery) => Promise<{ stage: string }> },
+  handle: { query: (q: typeof statusQuery) => Promise<PaymentResult['status']> },
   stage: string,
   timeoutMs = 15_000,
+  extra: (st: PaymentResult['status']) => boolean = () => true,
 ) {
   const start = Date.now();
   for (;;) {
     try {
-      if ((await handle.query(statusQuery)).stage === stage) return;
+      const st = await handle.query(statusQuery);
+      if (st.stage === stage && extra(st)) return;
     } catch {
       // el workflow aún no procesó su primera tarea
     }

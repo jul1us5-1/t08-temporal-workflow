@@ -1,10 +1,10 @@
 /**
- * Implementación HTTP de los puertos. Las rutas son una PROPUESTA de contrato
- * para acordar con cada equipo (ver docs/contratos.md); cámbialas aquí cuando
- * los otros módulos publiquen sus APIs definitivas.
+ * Implementación HTTP de los puertos. Las rutas son [PROP]: una propuesta de
+ * contrato para acordar con cada equipo (ver docs/contratos.md); cámbialas aquí
+ * cuando los otros módulos publiquen sus APIs definitivas.
  *
- * Convención de errores esperada de los otros servicios:
- *   4xx con cuerpo { "error": "<TipoNoReintentable>", "message": "..." } → DomainError
+ * Convención de errores (la de los servicios del club, RFC 9457):
+ *   4xx con un código AGP no reintentable (ver NON_RETRYABLE_ERRORS) → DomainError
  *   5xx / red / timeout → se reintenta (lo decide Temporal)
  */
 import { DomainError, isNonRetryableType } from '../shared/errors';
@@ -13,7 +13,6 @@ import {
   PaymentRequest,
   PolicyDecision,
   RailSubmission,
-  ReconciliationResult,
   Reservation,
   SettlementStatus,
 } from '../shared/types';
@@ -24,7 +23,6 @@ export interface ServiceUrls {
   session: string; // T-07
   rail: string; // T-13 (o el gateway de IMP-08)
   ledger: string; // T-14
-  reconciliation: string; // T-15
 }
 
 export function serviceUrlsFromEnv(env = process.env): ServiceUrls {
@@ -34,7 +32,6 @@ export function serviceUrlsFromEnv(env = process.env): ServiceUrls {
     session: get('PAYMENT_SESSION_URL', 'http://localhost:8107'),
     rail: get('RAIL_URL', 'http://localhost:8113'),
     ledger: get('LEDGER_URL', 'http://localhost:8114'),
-    reconciliation: get('RECONCILIATION_URL', 'http://localhost:8115'),
   };
 }
 
@@ -57,10 +54,24 @@ async function request<T>(
   const text = await res.text();
   const json = text ? JSON.parse(text) : undefined;
   if (res.ok) return json as T;
-  if (res.status >= 400 && res.status < 500 && isNonRetryableType(json?.error)) {
-    throw new DomainError(json.error, json.message ?? `${method} ${path} → ${res.status}`);
+  const code = errorCode(json);
+  if (res.status >= 400 && res.status < 500 && isNonRetryableType(code)) {
+    throw new DomainError(code, json?.detail ?? json?.message ?? `${method} ${path} → ${res.status}`);
   }
   throw new Error(`${method} ${base}${path} → HTTP ${res.status}: ${text.slice(0, 200)}`);
+}
+
+/**
+ * Extrae el código AGP de una respuesta de error. Los servicios del club
+ * responden RFC 9457 (ver `toProblemDetails` en ap-reconciliation-service):
+ * `title: "AGP-XXX-NNNN nombre"`, `type: ".../errors/AGP-XXX-NNNN"`.
+ * También acepta `{ "error": "<código>" }`.
+ */
+export function errorCode(body: unknown): string | undefined {
+  const b = body as { title?: unknown; type?: unknown; error?: unknown } | undefined;
+  const fromTitle = typeof b?.title === 'string' ? /^(AGP-[A-Z]+-\d{4})\b/.exec(b.title)?.[1] : undefined;
+  const fromType = typeof b?.type === 'string' ? /(AGP-[A-Z]+-\d{4})$/.exec(b.type)?.[1] : undefined;
+  return fromTitle ?? fromType ?? (typeof b?.error === 'string' ? b.error : undefined);
 }
 
 export function createHttpPorts(urls: ServiceUrls): Ports {
@@ -88,10 +99,6 @@ export function createHttpPorts(urls: ServiceUrls): Ports {
     ledger: {
       record: (paymentId: string, event: LedgerEvent, data: Record<string, string | undefined>, k: string) =>
         request<void>(urls.ledger, 'POST', `/v1/payments/${encodeURIComponent(paymentId)}/events`, { event, data }, k),
-    },
-    reconciliation: {
-      reconcile: (paymentId: string, externalRef: string, k: string) =>
-        request<ReconciliationResult>(urls.reconciliation, 'POST', '/v1/matches', { paymentId, externalRef }, k),
     },
   };
 }

@@ -7,7 +7,8 @@
  * Reglas de diseño:
  *  1. El workflow no contiene reglas de negocio: pregunta a Policy (T-06),
  *     reserva en Payment Session Manager (T-07), ejecuta vía Rail (T-13),
- *     registra en Ledger (T-14) y pide match a Reconciliation (T-15).
+ *     registra en Ledger (T-14) y aplica las intenciones que emite
+ *     Reconciliation (T-15) por la señal `reconciliationIntent`.
  *  2. Toda llamada lleva una idempotencyKey determinista `${paymentId}:${paso}`,
  *     así un reintento de Temporal nunca duplica un efecto.
  *  3. Cada efecto con reverso registra su compensación ANTES de continuar;
@@ -15,6 +16,8 @@
  *     ser canceladas y con reintentos ilimitados.
  *  4. Una vez liquidado, el pago no se revierte automáticamente: cualquier
  *     discrepancia queda como excepción de conciliación (NEEDS_REVIEW).
+ *  5. Todo motivo de fallo empieza con un código AGP-ORC (src/errors/taxonomy.ts)
+ *     o, si viene de T-15, conserva su código AGP-REC.
  */
 import {
   ActivityFailure,
@@ -27,7 +30,6 @@ import {
   log,
   proxyActivities,
   setHandler,
-  sleep,
   workflowInfo,
 } from '@temporalio/workflow';
 import type { Activities } from '../activities';
@@ -41,6 +43,7 @@ import {
   PaymentResult,
   PaymentStage,
   PaymentStatus,
+  ReconciliationIntent,
   SettlementSignal,
 } from '../shared/types';
 
@@ -48,6 +51,8 @@ import {
 
 export const approvalSignal = defineSignal<[ApprovalSignal]>('approval');
 export const settlementSignal = defineSignal<[SettlementSignal]>('settlement');
+/** Intenciones de T-15 (ap-reconciliation-service, WorkflowPort). */
+export const reconciliationIntentSignal = defineSignal<[ReconciliationIntent]>('reconciliationIntent');
 export const statusQuery = defineQuery<PaymentStatus>('status');
 
 // ----- Activities con sus políticas de reintento -----
@@ -94,7 +99,13 @@ export async function paymentOrchestrationWorkflow(
   const { paymentId } = req;
   const key = (step: string) => `${paymentId}:${step}`;
 
-  const status: PaymentStatus = { paymentId, stage: 'INITIATED', compensations: [], history: [] };
+  const status: PaymentStatus = {
+    paymentId,
+    stage: 'INITIATED',
+    compensations: [],
+    history: [],
+    appliedIntents: [],
+  };
   const setStage = (stage: PaymentStage) => {
     status.stage = stage;
     status.history.push({ stage, at: new Date().toISOString() }); // Date es determinista dentro de workflows
@@ -103,6 +114,8 @@ export async function paymentOrchestrationWorkflow(
 
   let approval: ApprovalSignal | undefined;
   const settlements = new Map<string, SettlementSignal>();
+  const intents: ReconciliationIntent[] = [];
+  const seenIntents = new Set<string>();
 
   setHandler(statusQuery, () => status);
   setHandler(approvalSignal, (s) => {
@@ -110,6 +123,12 @@ export async function paymentOrchestrationWorkflow(
   });
   setHandler(settlementSignal, (s) => {
     settlements.set(s.externalRef, s);
+  });
+  setHandler(reconciliationIntentSignal, (i) => {
+    // T-15 entrega at-least-once: se descartan duplicados por intent_id.
+    if (i.payment_id !== paymentId || seenIntents.has(i.intent_id)) return;
+    seenIntents.add(i.intent_id);
+    intents.push(i);
   });
 
   const finish = (outcome: PaymentResult['outcome']): PaymentResult => ({ paymentId, outcome, status });
@@ -126,11 +145,13 @@ export async function paymentOrchestrationWorkflow(
       setStage('AWAITING_APPROVAL');
       const gotAnswer = await condition(() => approval !== undefined, ms(options.approvalTimeout));
       if (!gotAnswer || !approval?.approved) {
-        const reason = !gotAnswer ? 'approval_timeout' : `rejected_by:${approval?.approverId}`;
+        const reason = !gotAnswer
+          ? `${ERROR_CODES.APPROVAL_TIMEOUT}: sin respuesta tras ${options.approvalTimeout}`
+          : `${ERROR_CODES.APPROVAL_REJECTED}: rechazado por ${approval?.approverId}`;
         return await reject(reason);
       }
     } else if (decision.outcome === 'DENY') {
-      return await reject(decision.reason);
+      return await reject(`${ERROR_CODES.POLICY_DENIED}: ${decision.reason}`);
     }
   } catch (err) {
     if (!isCancellation(err)) throw err;
@@ -240,7 +261,7 @@ export async function paymentOrchestrationWorkflow(
   await mustSucceed.recordLedgerEvent(
     paymentId,
     status.reconciliation === 'MATCHED' ? 'PAYMENT_RECONCILED' : 'RECONCILIATION_EXCEPTION',
-    { externalRef: status.externalRef, reason: status.failureReason },
+    { externalRef: status.externalRef, code: status.reconciliationCode, reason: status.failureReason },
     key('ledger:reconciled'),
   );
   setStage('COMPLETED');
@@ -282,20 +303,55 @@ export async function paymentOrchestrationWorkflow(
     }
   }
 
+  /**
+   * Aplica las intenciones de T-15 hasta llegar a una final.
+   * T-15 decide (compara ledger vs fuente externa); T-08 solo actúa.
+   */
   async function reconcile(externalRef: string): Promise<'MATCHED' | 'NEEDS_REVIEW'> {
-    const deadline = Date.now() + ms(options.reconciliationTimeout);
-    for (let attempt = 0; ; attempt++) {
-      const r = await mustSucceed.requestReconciliation(paymentId, externalRef, key(`reconcile:${attempt}`));
-      if (r.status === 'MATCHED') return 'MATCHED';
-      if (r.status === 'MISMATCH') {
-        status.failureReason = `reconciliation_mismatch:${r.reason}`;
+    let deadline = Date.now() + ms(options.reconciliationTimeout);
+    for (;;) {
+      const remaining = deadline - Date.now();
+      const got = remaining > 0 && (await condition(() => intents.length > 0, remaining));
+      if (!got) {
+        status.reconciliationCode = ERROR_CODES.RECONCILIATION_TIMEOUT;
+        status.failureReason = `${ERROR_CODES.RECONCILIATION_TIMEOUT}: sin intención final de T-15 tras ${options.reconciliationTimeout}`;
         return 'NEEDS_REVIEW';
       }
-      if (Date.now() >= deadline) {
-        status.failureReason = 'reconciliation_timeout';
-        return 'NEEDS_REVIEW';
+      const intent = intents.shift()!;
+      status.appliedIntents.push(intent.intent_id);
+
+      switch (intent.kind) {
+        case 'RECONCILED':
+          return 'MATCHED';
+        case 'REQUIRES_REVIEW':
+          status.reconciliationCode = intent.code ?? ERROR_CODES.RECONCILIATION_REVIEW_REQUIRED;
+          status.failureReason = `${ERROR_CODES.RECONCILIATION_REVIEW_REQUIRED}: ${intent.code ?? ''} ${intent.reason}`.trim();
+          return 'NEEDS_REVIEW';
+        case 'RETRY':
+          // T-15 reprograma la observación (2001/4001/4002/9001); seguimos esperando.
+          continue;
+        case 'REOPEN_COMPENSATE':
+          // Reorg o finality: el pago se reabre y se vuelve a esperar la liquidación.
+          // Nunca se marca RECONCILED sin una nueva intención de T-15.
+          setStage('REOPENED');
+          await mustSucceed.recordLedgerEvent(
+            paymentId,
+            'PAYMENT_REOPENED',
+            { externalRef, code: intent.code ?? undefined, evidence: intent.evidence },
+            key(`ledger:reopened:${intent.intent_id}`),
+          );
+          settlements.delete(externalRef);
+          try {
+            await waitForSettlement(externalRef);
+          } catch (err) {
+            status.reconciliationCode = ERROR_CODES.REORG_UNRESOLVED;
+            status.failureReason = `${ERROR_CODES.REORG_UNRESOLVED}: ${describe(err)}`;
+            return 'NEEDS_REVIEW';
+          }
+          setStage('RECONCILING');
+          deadline = Date.now() + ms(options.reconciliationTimeout);
+          continue;
       }
-      await sleep(Math.min(ms(options.settlementPollInterval), Math.max(deadline - Date.now(), 1)));
     }
   }
 }
@@ -326,7 +382,7 @@ function describe(err: unknown): string {
 export function ms(d: string | number): number {
   if (typeof d === 'number') return d;
   const m = /^(\d+(?:\.\d+)?)\s*(ms|s|m|h|d)$/.exec(d.trim());
-  if (!m) throw ApplicationFailure.create({ type: ERROR_CODES.VALIDATION_ERROR, message: `duración inválida: ${d}`, nonRetryable: true });
+  if (!m) throw ApplicationFailure.create({ type: ERROR_CODES.INVALID_REQUEST, message: `duración inválida: ${d}`, nonRetryable: true });
   const n = Number(m[1]);
   const unit = { ms: 1, s: 1_000, m: 60_000, h: 3_600_000, d: 86_400_000 }[m[2] as 'ms' | 's' | 'm' | 'h' | 'd'];
   return n * unit;

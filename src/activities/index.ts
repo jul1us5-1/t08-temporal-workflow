@@ -16,7 +16,6 @@ import {
   PaymentRequest,
   PolicyDecision,
   RailSubmission,
-  ReconciliationResult,
   Reservation,
   SettlementStatus,
 } from '../shared/types';
@@ -77,14 +76,6 @@ export function createActivities(ports: Ports) {
       idempotencyKey: string,
     ): Promise<void> {
       return call(() => ports.ledger.record(paymentId, event, data, idempotencyKey));
-    },
-
-    async requestReconciliation(
-      paymentId: string,
-      externalRef: string,
-      idempotencyKey: string,
-    ): Promise<ReconciliationResult> {
-      return call(() => ports.reconciliation.reconcile(paymentId, externalRef, idempotencyKey));
     },
   };
 }

@@ -12,7 +12,6 @@ import {
   PaymentRequest,
   PolicyDecision,
   RailSubmission,
-  ReconciliationResult,
   Reservation,
   SettlementStatus,
 } from '../shared/types';
@@ -20,7 +19,7 @@ import { LedgerEvent, Ports } from './ports';
 
 export interface FakeBehaviour {
   policy: PolicyDecision['outcome'];
-  /** Si true, reserve responde AGP-ORC-INSUFFICIENT_AUTHORITY. */
+  /** Si true, reserve responde AGP-ORC-2001 (insufficient_authority). */
   insufficientAuthority: boolean;
   /** Nº de veces que execute falla con error transitorio antes de funcionar. */
   railTransientFailures: number;
@@ -31,7 +30,6 @@ export interface FakeBehaviour {
   /** Qué devuelve getStatus mientras está PENDING; null = nunca cambia. */
   settlesAfterPolls: number | null;
   settlementFails: boolean;
-  reconciliation: ReconciliationResult['status'];
 }
 
 export const DEFAULT_BEHAVIOUR: FakeBehaviour = {
@@ -42,7 +40,6 @@ export const DEFAULT_BEHAVIOUR: FakeBehaviour = {
   railSubmission: 'SETTLED',
   settlesAfterPolls: 0,
   settlementFails: false,
-  reconciliation: 'MATCHED',
 };
 
 export interface FakeState {
@@ -124,13 +121,6 @@ export function createFakePorts(overrides: Partial<FakeBehaviour> = {}): { ports
         await once(k, () => {
           state.ledger.push({ paymentId, event, data });
         });
-      },
-    },
-    reconciliation: {
-      async reconcile(): Promise<ReconciliationResult> {
-        state.calls.push('reconciliation.reconcile');
-        const s = behaviour.reconciliation;
-        return s === 'MISMATCH' ? { status: 'MISMATCH', reason: 'amount_differs' } : { status: s };
       },
     },
   };
